@@ -190,3 +190,21 @@ python backend/services/extract_reference.py \
 | Head pose  | solvePnP (Yaw/Pitch/Roll)   |
 | Comparison | DTW (pure Python)           |
 | Storage    | JSON (POC)                  |
+
+
+### Hand Feature Mathematics
+
+MediaPipe provides 21 hand landmarks with `(x, y, z)` coordinates. Additional geometric features are derived using:
+
+* **3D Distance:** `d = √((x₂−x₁)² + (y₂−y₁)² + (z₂−z₁)²)`
+* **Joint Angle:** For three landmarks **A, B, C**, where **B is the joint**, vectors are defined as:
+
+  * `BA = A − B`
+  * `BC = C − B`
+  * `θ = cos⁻¹((BA · BC) / (|BA||BC|))`
+
+  For example, for the index finger, landmarks **5, 6, 7** represent MCP, PIP, and DIP, so the angle is calculated at landmark **6 (PIP)**.
+
+* **Normalization:** landmarks are translated relative to the wrist and scaled by palm size.
+* **Palm Orientation:** calculated using the cross product of vectors from the wrist to the index and pinky MCPs.
+* **Wrist Orientation:** estimated from landmark-based direction vectors using yaw, pitch, and roll.
