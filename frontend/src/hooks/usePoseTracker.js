@@ -12,7 +12,11 @@
  */
 
 import { useRef, useCallback, useState, useEffect } from 'react';
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import { 
+    FaceLandmarker,
+    FilesetResolver,
+    HandLandmarker
+  } from '@mediapipe/tasks-vision';
 
 // const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 const API = 'https://mletu-production.up.railway.app';
@@ -27,6 +31,57 @@ const MP_MODELS = [
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/face_landmarker.task',
 ];
+
+const HAND_MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+
+// ---------------------------------------------------------------------------
+// HandLandmarker singleton
+// ---------------------------------------------------------------------------
+
+let _handLandmarkerPromise = null;
+
+async function getHandLandmarker() {
+  if (_handLandmarkerPromise) return _handLandmarkerPromise;
+
+  _handLandmarkerPromise = (async () => {
+    const vision = await FilesetResolver.forVisionTasks(WASM_BASE);
+
+    try {
+      const hl = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: HAND_MODEL_URL,
+          delegate: 'GPU',
+        },
+        runningMode: 'VIDEO',
+        numHands: 2,
+      });
+
+      console.log('[MP] HandLandmarker ready.');
+      return hl;
+    } catch (gpuError) {
+      console.warn(
+        '[MP] Hand GPU failed. Trying CPU...',
+        gpuError.message
+      );
+
+      const hl = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: HAND_MODEL_URL,
+          delegate: 'CPU',
+        },
+        runningMode: 'VIDEO',
+        numHands: 2,
+      });
+
+      console.log('[MP] HandLandmarker ready (CPU fallback).');
+      return hl;
+    }
+  })();
+
+  return _handLandmarkerPromise;
+}
 
 // ---------------------------------------------------------------------------
 // FaceLandmarker singleton
@@ -138,6 +193,474 @@ async function detectPose(videoEl) {
   return pose;
 }
 
+async function detectHands(videoEl) {
+  let handLandmarker;
+
+  try {
+    handLandmarker = await getHandLandmarker();
+  } catch {
+    return null;
+  }
+
+  if (!videoEl || videoEl.readyState < 2) return null;
+
+  let result;
+
+  try {
+    result = handLandmarker.detectForVideo(
+      videoEl,
+      performance.now()
+    );
+  } catch {
+    return null;
+  }
+
+  if (!result?.landmarks?.length) {
+    return {
+      left: null,
+      right: null,
+    };
+  }
+
+  const hands = {
+    left: null,
+    right: null,
+  };
+
+  result.landmarks.forEach((landmarks, index) => {
+    const handedness =
+      result.handednesses?.[index]?.[0]?.categoryName;
+
+    const handData = extractHandFeatures(landmarks);
+
+    if (handedness === 'Left') {
+      hands.left = handData;
+    } else if (handedness === 'Right') {
+      hands.right = handData;
+    }
+  });
+
+  return hands;
+}
+
+// ---------------------------------------------------------------------------
+// Extract hand features for mudra recognition
+//
+// Input:
+//   21 MediaPipe hand landmarks
+//
+// Output:
+//   Raw landmarks + normalized geometry + joint angles + distances
+//
+// The raw landmarks are intentionally preserved because later ML models
+// may need information that our manually engineered features don't capture.
+// ---------------------------------------------------------------------------
+
+function distance3D(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = (a.z || 0) - (b.z || 0);
+
+  return Math.sqrt(
+    dx * dx +
+    dy * dy +
+    dz * dz
+  );
+}
+
+function angle3D(a, b, c) {
+  // Angle ABC
+  const v1 = {
+    x: a.x - b.x,
+    y: a.y - b.y,
+    z: (a.z || 0) - (b.z || 0),
+  };
+
+  const v2 = {
+    x: c.x - b.x,
+    y: c.y - b.y,
+    z: (c.z || 0) - (b.z || 0),
+  };
+
+  const dot =
+    v1.x * v2.x +
+    v1.y * v2.y +
+    v1.z * v2.z;
+
+  const mag1 = Math.sqrt(
+    v1.x ** 2 +
+    v1.y ** 2 +
+    v1.z ** 2
+  );
+
+  const mag2 = Math.sqrt(
+    v2.x ** 2 +
+    v2.y ** 2 +
+    v2.z ** 2
+  );
+
+  if (mag1 === 0 || mag2 === 0) return 0;
+
+  const cosine = Math.max(
+    -1,
+    Math.min(1, dot / (mag1 * mag2))
+  );
+
+  return Math.acos(cosine) * (180 / Math.PI);
+}
+
+function vectorMagnitude(v) {
+  return Math.sqrt(
+    v.x * v.x +
+    v.y * v.y +
+    v.z * v.z
+  );
+}
+
+function normalizeVector(v) {
+  const mag = vectorMagnitude(v) || 0.001;
+
+  return {
+    x: v.x / mag,
+    y: v.y / mag,
+    z: v.z / mag,
+  };
+}
+
+function calculateWristOrientation(landmarks) {
+  const wrist = landmarks[0];
+  const indexMCP = landmarks[5];
+  const pinkyMCP = landmarks[17];
+  const middleMCP = landmarks[9];
+
+  // Wrist → middle finger direction
+  const forward = normalizeVector({
+    x: middleMCP.x - wrist.x,
+    y: middleMCP.y - wrist.y,
+    z: (middleMCP.z || 0) - (wrist.z || 0),
+  });
+
+  // Index MCP → Pinky MCP
+  const side = normalizeVector({
+    x: pinkyMCP.x - indexMCP.x,
+    y: pinkyMCP.y - indexMCP.y,
+    z: (pinkyMCP.z || 0) - (indexMCP.z || 0),
+  });
+
+  // Palm normal
+  const palmNormal = normalizeVector({
+    x:
+      forward.y * side.z -
+      forward.z * side.y,
+
+    y:
+      forward.z * side.x -
+      forward.x * side.z,
+
+    z:
+      forward.x * side.y -
+      forward.y * side.x,
+  });
+
+  // Convert orientation vectors to angles
+  const yaw =
+    Math.atan2(
+      forward.x,
+      forward.z
+    ) * (180 / Math.PI);
+
+  const pitch =
+    Math.atan2(
+      -forward.y,
+      Math.sqrt(
+        forward.x ** 2 +
+        forward.z ** 2
+      )
+    ) * (180 / Math.PI);
+
+  const roll =
+    Math.atan2(
+      side.y,
+      side.x
+    ) * (180 / Math.PI);
+
+  return {
+    yaw: Number(yaw.toFixed(3)),
+    pitch: Number(pitch.toFixed(3)),
+    roll: Number(roll.toFixed(3)),
+
+    direction: {
+      x: Number(forward.x.toFixed(6)),
+      y: Number(forward.y.toFixed(6)),
+      z: Number(forward.z.toFixed(6)),
+    },
+
+    palmNormal: {
+      x: Number(palmNormal.x.toFixed(6)),
+      y: Number(palmNormal.y.toFixed(6)),
+      z: Number(palmNormal.z.toFixed(6)),
+    },
+  };
+}
+
+function normalizeLandmarks(landmarks) {
+  const wrist = landmarks[0];
+
+  // Palm scale:
+  // wrist → middle-finger MCP
+  const palmScale = distance3D(
+    landmarks[0],
+    landmarks[9]
+  ) || 0.001;
+
+  return landmarks.map((point) => ({
+    x: Number(((point.x - wrist.x) / palmScale).toFixed(6)),
+    y: Number(((point.y - wrist.y) / palmScale).toFixed(6)),
+    z: Number(((point.z - wrist.z) / palmScale).toFixed(6)),
+  }));
+}
+
+function extractHandFeatures(landmarks) {
+  if (!landmarks || landmarks.length !== 21) {
+    return null;
+  }
+
+  // ---------------------------------------------------------
+  // 1. Normalized landmarks
+  // ---------------------------------------------------------
+
+  const normalizedLandmarks =
+    normalizeLandmarks(landmarks);
+
+    const wrist = landmarks[0];
+
+    const wristPosition = {
+      x: Number(wrist.x.toFixed(6)),
+      y: Number(wrist.y.toFixed(6)),
+      z: Number((wrist.z || 0).toFixed(6)),
+    };
+
+    const wristOrientation =
+      calculateWristOrientation(landmarks);
+
+      
+  // ---------------------------------------------------------
+  // 2. Finger joint angles
+  //
+  // Thumb:  1-2-3-4
+  // Index:  5-6-7-8
+  // Middle: 9-10-11-12
+  // Ring:   13-14-15-16
+  // Pinky:  17-18-19-20
+  // ---------------------------------------------------------
+
+  const jointAngles = {
+    thumb: [
+      angle3D(landmarks[1], landmarks[2], landmarks[3]),
+      angle3D(landmarks[2], landmarks[3], landmarks[4]),
+    ],
+
+    index: [
+      angle3D(landmarks[5], landmarks[6], landmarks[7]),
+      angle3D(landmarks[6], landmarks[7], landmarks[8]),
+    ],
+
+    middle: [
+      angle3D(landmarks[9], landmarks[10], landmarks[11]),
+      angle3D(landmarks[10], landmarks[11], landmarks[12]),
+    ],
+
+    ring: [
+      angle3D(landmarks[13], landmarks[14], landmarks[15]),
+      angle3D(landmarks[14], landmarks[15], landmarks[16]),
+    ],
+
+    pinky: [
+      angle3D(landmarks[17], landmarks[18], landmarks[19]),
+      angle3D(landmarks[18], landmarks[19], landmarks[20]),
+    ],
+  };
+
+  // ---------------------------------------------------------
+  // 3. Important fingertip distances
+  // ---------------------------------------------------------
+
+  const fingertipDistances = {
+    thumb_index: distance3D(
+      landmarks[4],
+      landmarks[8]
+    ),
+
+    thumb_middle: distance3D(
+      landmarks[4],
+      landmarks[12]
+    ),
+
+    thumb_ring: distance3D(
+      landmarks[4],
+      landmarks[16]
+    ),
+
+    thumb_pinky: distance3D(
+      landmarks[4],
+      landmarks[20]
+    ),
+
+    index_middle: distance3D(
+      landmarks[8],
+      landmarks[12]
+    ),
+
+    middle_ring: distance3D(
+      landmarks[12],
+      landmarks[16]
+    ),
+
+    ring_pinky: distance3D(
+      landmarks[16],
+      landmarks[20]
+    ),
+  };
+
+  // ---------------------------------------------------------
+  // 4. Finger lengths
+  //
+  // Useful for understanding whether fingers are extended,
+  // folded, or positioned close to the palm.
+  // ---------------------------------------------------------
+
+  const fingerLengths = {
+    thumb:
+      distance3D(landmarks[1], landmarks[4]),
+
+    index:
+      distance3D(landmarks[5], landmarks[8]),
+
+    middle:
+      distance3D(landmarks[9], landmarks[12]),
+
+    ring:
+      distance3D(landmarks[13], landmarks[16]),
+
+    pinky:
+      distance3D(landmarks[17], landmarks[20]),
+  };
+
+  // ---------------------------------------------------------
+  // 5. Palm orientation
+  //
+  // Construct two vectors from the wrist:
+  // wrist → index MCP
+  // wrist → pinky MCP
+  //
+  // Their cross product gives an approximate palm normal.
+  // ---------------------------------------------------------
+
+  //const wrist = landmarks[0];
+  const indexMCP = landmarks[5];
+  const pinkyMCP = landmarks[17];
+
+  const v1 = {
+    x: indexMCP.x - wrist.x,
+    y: indexMCP.y - wrist.y,
+    z: (indexMCP.z || 0) - (wrist.z || 0),
+  };
+
+  const v2 = {
+    x: pinkyMCP.x - wrist.x,
+    y: pinkyMCP.y - wrist.y,
+    z: (pinkyMCP.z || 0) - (wrist.z || 0),
+  };
+
+  const palmNormal = {
+    x: v1.y * v2.z - v1.z * v2.y,
+    y: v1.z * v2.x - v1.x * v2.z,
+    z: v1.x * v2.y - v1.y * v2.x,
+  };
+
+  const palmNormalMagnitude = Math.sqrt(
+    palmNormal.x ** 2 +
+    palmNormal.y ** 2 +
+    palmNormal.z ** 2
+  ) || 0.001;
+
+  const normalizedPalmNormal = {
+    x: Number(
+      (palmNormal.x / palmNormalMagnitude).toFixed(6)
+    ),
+    y: Number(
+      (palmNormal.y / palmNormalMagnitude).toFixed(6)
+    ),
+    z: Number(
+      (palmNormal.z / palmNormalMagnitude).toFixed(6)
+    ),
+  };
+
+  // ---------------------------------------------------------
+  // Return complete representation
+  // ---------------------------------------------------------
+
+  return {
+    landmarks: landmarks.map((point, index) => ({
+      id: index,
+      x: Number(point.x.toFixed(6)),
+      y: Number(point.y.toFixed(6)),
+      z: Number((point.z || 0).toFixed(6)),
+    })),
+
+    normalizedLandmarks,
+
+    jointAngles,
+
+    fingertipDistances,
+
+    fingerLengths,
+
+    // Where is the wrist?
+    wristPosition,
+
+    // How is the wrist/hand oriented?
+    wristOrientation,
+
+    // Existing palm orientation
+    palmNormal: normalizedPalmNormal,
+  };
+}
+
+
+//---------------------------------------------------------------------------
+// Debugging utility: log hand summary to console
+//---------------------------------------------------------------------------
+
+function logHandSummary(hand, side) {
+  if (!hand) return;
+
+  console.log(`%c[${side} HAND]`, 'font-weight:bold; color:green;');
+
+  console.log('Landmarks:', hand.landmarks.length);
+
+  console.log('Joint Angles:', {
+    thumb: hand.jointAngles.thumb,
+    index: hand.jointAngles.index,
+    middle: hand.jointAngles.middle,
+    ring: hand.jointAngles.ring,
+    pinky: hand.jointAngles.pinky,
+  });
+
+  console.log('Wrist Position:', hand.wristPosition);
+
+  console.log('Wrist Orientation:', {
+    yaw: hand.wristOrientation.yaw,
+    pitch: hand.wristOrientation.pitch,
+    roll: hand.wristOrientation.roll,
+  });
+
+  console.log('Palm Normal:', hand.palmNormal);
+
+  console.log('Fingertip Distances:', hand.fingertipDistances);
+}
+
+
 // ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
@@ -194,6 +717,35 @@ export function usePoseTracker() {
       }
 
       const rawPose = await detectPose(vid);
+
+      const hands = await detectHands(vid);
+      /** 
+       if (hands) {
+        console.log('[HANDS]', {
+          left: !!hands.left,
+          right: !!hands.right,
+        });
+
+        if (hands.left) {
+          console.log('[LEFT HAND FEATURES]', hands.left);
+        }
+
+        if (hands.right) {
+          console.log('[RIGHT HAND FEATURES]', hands.right);
+        }
+      }
+      */
+
+      if (hands) {
+        if (hands.left) {
+          logHandSummary(hands.left, 'LEFT');
+        }
+
+        if (hands.right) {
+          logHandSummary(hands.right, 'RIGHT');
+        }
+      }     
+
       const visible = !!rawPose;
       const pose    = rawPose || { yaw: 0, pitch: 0, roll: 0 };
 
