@@ -2,6 +2,7 @@ import json
 import os
 import uuid
 from typing import Dict, List, Optional
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +26,23 @@ VIDEO_CONFIGS = {
         "label":  "Right-Left Head Movements",
         "icon":   "↔",
         "desc":   "Turn your head right and left",
+    },
+    "pataka": {
+        "video": "reference/pataka.mp4",
+        "json": "reference/pataka.json",
+        "label": "Pataka",
+        "icon": "✋",
+        "desc": "Perform the Pataka mudra",
+        "tracking": "hand",
+    },
+
+    "tri_pataka": {
+        "video": "reference/tri_pataka.mp4",
+        "json": "reference/tri_pataka.json",
+        "label": "Tri Pataka",
+        "icon": "🤚",
+        "desc": "Perform the Tri Pataka mudra",
+        "tracking": "hand",
     },
 }
 
@@ -50,7 +68,9 @@ if not REFERENCE_DATA:
     raise RuntimeError(
         "No reference JSON found. Run extract_reference.py for at least one video type.\n"
         "  python services/extract_reference.py --video reference/up-down.mp4 --output reference/up-down.json\n"
-        "  python services/extract_reference.py --video reference/right-left.mp4 --output reference/right-left.json"
+        "  python services/extract_reference.py --video reference/right-left.mp4 --output reference/right-left.json\n"
+        "  python services/extract_reference.py --video reference/pataka.mp4 --output reference/pataka.json\n"
+        "  python services/extract_reference.py --video reference/tri_pataka.mp4 --output reference/tri_pataka.json"
     )
 
 SESSIONS: Dict[str, Dict] = {}
@@ -72,10 +92,14 @@ app.add_middleware(
 class PoseFrame(BaseModel):
     session_id: str
     time:       float
+
+    tracking_mode: str = "face"  # "face" or "hand"
+
     yaw:        float
     pitch:      float
     roll:       float
     visible:    bool = True
+    hands: Optional[Dict[str, Any]] = None
 
 
 class StartSessionRequest(BaseModel):
@@ -102,6 +126,7 @@ def list_videos():
             "desc":        cfg["desc"],
             "available":   vt in REFERENCE_DATA,
             "has_video":   os.path.exists(cfg["video"]),
+            "tracking":    cfg["tracking"],
             "duration":    ref.get("duration") if ref else None,
             "keyframes":   len(ref["sequence"]) if ref else 0,
         })
@@ -152,12 +177,33 @@ def start_session(body: StartSessionRequest):
 def submit_pose(payload: PoseFrame):
     if payload.session_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session not found")
-    SESSIONS[payload.session_id]["frames"].append({
-        "time":    payload.time,
-        "yaw":     payload.yaw,
-        "pitch":   payload.pitch,
-        "roll":    payload.roll,
+    session = SESSIONS[payload.session_id]
+
+    video_type = session["video_type"]
+    expected_tracking = VIDEO_CONFIGS[video_type]["tracking"]
+
+    if payload.tracking_mode != expected_tracking:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Tracking mode mismatch. "
+                f"Video '{video_type}' requires "
+                f"'{expected_tracking}' tracking."
+            ),
+        )
+        
+    session["frames"].append({
+        "time": payload.time,
+
+        "tracking_mode": payload.tracking_mode,
+
+        "yaw": payload.yaw,
+        "pitch": payload.pitch,
+        "roll": payload.roll,
+
         "visible": payload.visible,
+
+        "hands": payload.hands,
     })
     count = len(SESSIONS[payload.session_id]["frames"])
     return {"received": True, "count": count}

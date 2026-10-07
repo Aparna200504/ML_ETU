@@ -25,6 +25,80 @@ const API = 'https://mletu-production.up.railway.app';
 const SAMPLE_INTERVAL_MS = 167; // ~6 frames/sec — matches extract_reference.py's sample_rate=6,
                                  // so fast head turns aren't clipped below the true peak angle
 
+function isValidLandmark(point) {
+  return (
+    point &&
+    Number.isFinite(point.x) &&
+    Number.isFinite(point.y) &&
+    Number.isFinite(point.z)
+  );
+}
+
+
+const FINGER_LANDMARKS = {
+  thumb:  [1, 2, 3, 4],
+  index:  [5, 6, 7, 8],
+  middle: [9, 10, 11, 12],
+  ring:   [13, 14, 15, 16],
+  pinky:  [17, 18, 19, 20],
+};
+
+
+/**
+ * Determine which individual fingers have usable landmarks.
+ *
+ * IMPORTANT:
+ * MediaPipe does not provide a true visibility score for every
+ * hand landmark. Therefore this function does NOT claim that a
+ * finger is visually visible with certainty.
+ *
+ * It only determines whether the landmarks needed for calculating
+ * that finger's features are usable.
+ */
+function calculateFingerValidity(landmarks) {
+  const result = {};
+
+  for (const [finger, indices] of Object.entries(FINGER_LANDMARKS)) {
+    const validCount = indices.filter(
+      index => isValidLandmark(landmarks[index])
+    ).length;
+
+    result[finger] = {
+      valid: validCount === indices.length,
+      validLandmarks: validCount,
+      totalLandmarks: indices.length,
+    };
+  }
+
+  return result;
+}
+
+
+function calculateHandReliability(landmarks) {
+  if (!landmarks || landmarks.length !== 21) {
+    return {
+      reliable: false,
+      visibleLandmarks: 0,
+      confidence: 0,
+      fingers: {},
+    };
+  }
+
+  const validLandmarks = landmarks.filter(isValidLandmark);
+
+  const visibilityRatio =
+    validLandmarks.length / 21;
+
+  const fingers = calculateFingerValidity(landmarks);
+
+  return {
+    reliable: visibilityRatio >= 0.8,
+    visibleLandmarks: validLandmarks.length,
+    confidence: Number(visibilityRatio.toFixed(3)),
+    fingers,
+  };
+}
+                                 
 const WASM_BASE = `${window.location.origin}/mediapipe/wasm`;
 
 const MP_MODELS = [
@@ -403,6 +477,10 @@ function calculateWristOrientation(landmarks) {
   };
 }
 
+// ---------------------------------------------------------------------------  
+// Normalize hand landmarks to a wrist-centered coordinate system
+// and scale them by the palm size (wrist → middle finger MCP).
+// ---------------------------------------------------------------------------
 function normalizeLandmarks(landmarks) {
   const wrist = landmarks[0];
 
@@ -420,7 +498,86 @@ function normalizeLandmarks(landmarks) {
   }));
 }
 
+/**
+ * function normalizeLandmarks(landmarks) {
+  const wrist = landmarks[0];
+
+  // Palm scale:
+  // wrist → middle-finger MCP
+  const palmScale = distance3D(
+    landmarks[0],
+    landmarks[9]
+  ) || 0.001;
+
+  return landmarks.map((point) => ({
+    x: Number(((point.x - wrist.x) / palmScale).toFixed(6)),
+    y: Number(((point.y - wrist.y) / palmScale).toFixed(6)),
+    z: Number(((point.z - wrist.z) / palmScale).toFixed(6)),
+  }));
+}
+ */
+
+/**
+ * function calculateHandReliability(landmarks) {
+  if (!landmarks || landmarks.length !== 21) {
+    return {
+      reliable: false,
+      visibleLandmarks: 0,
+      confidence: 0,
+    };
+  }
+
+  // MediaPipe landmark coordinates are still returned even
+  // when some parts of the hand are occluded.
+  // Check whether landmarks contain valid coordinates.
+  const validLandmarks = landmarks.filter(
+    (p) =>
+      Number.isFinite(p.x) &&
+      Number.isFinite(p.y) &&
+      Number.isFinite(p.z)
+  );
+
+  const visibilityRatio = validLandmarks.length / 21;
+
+  return {
+    reliable: visibilityRatio >= 0.8,
+    visibleLandmarks: validLandmarks.length,
+    confidence: Number(visibilityRatio.toFixed(3)),
+  };
+}
+ */
+
+function calculateHandReliability(landmarks) {
+  if (!landmarks || landmarks.length !== 21) {
+    return {
+      reliable: false,
+      visibleLandmarks: 0,
+      confidence: 0,
+    };
+  }
+
+  // MediaPipe landmark coordinates are still returned even
+  // when some parts of the hand are occluded.
+  // Check whether landmarks contain valid coordinates.
+  const validLandmarks = landmarks.filter(
+    (p) =>
+      Number.isFinite(p.x) &&
+      Number.isFinite(p.y) &&
+      Number.isFinite(p.z)
+  );
+
+  const visibilityRatio = validLandmarks.length / 21;
+
+  return {
+    reliable: visibilityRatio >= 0.8,
+    visibleLandmarks: validLandmarks.length,
+    confidence: Number(visibilityRatio.toFixed(3)),
+  };
+}
+
+
 function extractHandFeatures(landmarks) {
+    const reliability = calculateHandReliability(landmarks);
   if (!landmarks || landmarks.length !== 21) {
     return null;
   }
@@ -453,39 +610,119 @@ function extractHandFeatures(landmarks) {
   // Ring:   13-14-15-16
   // Pinky:  17-18-19-20
   // ---------------------------------------------------------
+  
+    const fingerValidity = reliability.fingers;
 
-  const jointAngles = {
-    thumb: [
-      angle3D(landmarks[1], landmarks[2], landmarks[3]),
-      angle3D(landmarks[2], landmarks[3], landmarks[4]),
-    ],
+    const jointAngles = {
+      thumb: fingerValidity.thumb.valid
+        ? [
+            angle3D(landmarks[1], landmarks[2], landmarks[3]),
+            angle3D(landmarks[2], landmarks[3], landmarks[4]),
+          ]
+        : null,
 
-    index: [
-      angle3D(landmarks[5], landmarks[6], landmarks[7]),
-      angle3D(landmarks[6], landmarks[7], landmarks[8]),
-    ],
+      index: fingerValidity.index.valid
+        ? [
+            angle3D(landmarks[5], landmarks[6], landmarks[7]),
+            angle3D(landmarks[6], landmarks[7], landmarks[8]),
+          ]
+        : null,
 
-    middle: [
-      angle3D(landmarks[9], landmarks[10], landmarks[11]),
-      angle3D(landmarks[10], landmarks[11], landmarks[12]),
-    ],
+      middle: fingerValidity.middle.valid
+        ? [
+            angle3D(landmarks[9], landmarks[10], landmarks[11]),
+            angle3D(landmarks[10], landmarks[11], landmarks[12]),
+          ]
+        : null,
 
-    ring: [
-      angle3D(landmarks[13], landmarks[14], landmarks[15]),
-      angle3D(landmarks[14], landmarks[15], landmarks[16]),
-    ],
+      ring: fingerValidity.ring.valid
+        ? [
+            angle3D(landmarks[13], landmarks[14], landmarks[15]),
+            angle3D(landmarks[14], landmarks[15], landmarks[16]),
+          ]
+        : null,
 
-    pinky: [
-      angle3D(landmarks[17], landmarks[18], landmarks[19]),
-      angle3D(landmarks[18], landmarks[19], landmarks[20]),
-    ],
-  };
+      pinky: fingerValidity.pinky.valid
+        ? [
+            angle3D(landmarks[17], landmarks[18], landmarks[19]),
+            angle3D(landmarks[18], landmarks[19], landmarks[20]),
+          ]
+        : null,
+    };
 
+  /** 
+   * const jointAngles = {
+      thumb: [
+        angle3D(landmarks[1], landmarks[2], landmarks[3]),
+        angle3D(landmarks[2], landmarks[3], landmarks[4]),
+      ],
+
+      index: [
+        angle3D(landmarks[5], landmarks[6], landmarks[7]),
+        angle3D(landmarks[6], landmarks[7], landmarks[8]),
+      ],
+
+      middle: [
+        angle3D(landmarks[9], landmarks[10], landmarks[11]),
+        angle3D(landmarks[10], landmarks[11], landmarks[12]),
+      ],
+
+      ring: [
+        angle3D(landmarks[13], landmarks[14], landmarks[15]),
+        angle3D(landmarks[14], landmarks[15], landmarks[16]),
+      ],
+
+      pinky: [
+        angle3D(landmarks[17], landmarks[18], landmarks[19]),
+        angle3D(landmarks[18], landmarks[19], landmarks[20]),
+      ],
+    };
+
+  */
+  
   // ---------------------------------------------------------
   // 3. Important fingertip distances
   // ---------------------------------------------------------
+    
+    const fingertipDistances = {
+      thumb_index:
+        fingerValidity.thumb.valid && fingerValidity.index.valid
+          ? distance3D(landmarks[4], landmarks[8])
+          : null,
 
-  const fingertipDistances = {
+      thumb_middle:
+        fingerValidity.thumb.valid && fingerValidity.middle.valid
+          ? distance3D(landmarks[4], landmarks[12])
+          : null,
+
+      thumb_ring:
+        fingerValidity.thumb.valid && fingerValidity.ring.valid
+          ? distance3D(landmarks[4], landmarks[16])
+          : null,
+
+      thumb_pinky:
+        fingerValidity.thumb.valid && fingerValidity.pinky.valid
+          ? distance3D(landmarks[4], landmarks[20])
+          : null,
+
+      index_middle:
+        fingerValidity.index.valid && fingerValidity.middle.valid
+          ? distance3D(landmarks[8], landmarks[12])
+          : null,
+
+      middle_ring:
+        fingerValidity.middle.valid && fingerValidity.ring.valid
+          ? distance3D(landmarks[12], landmarks[16])
+          : null,
+
+      ring_pinky:
+        fingerValidity.ring.valid && fingerValidity.pinky.valid
+          ? distance3D(landmarks[16], landmarks[20])
+          : null,
+    };
+
+  /**
+   * const fingertipDistances = {
     thumb_index: distance3D(
       landmarks[4],
       landmarks[8]
@@ -521,7 +758,8 @@ function extractHandFeatures(landmarks) {
       landmarks[20]
     ),
   };
-
+*/
+  
   // ---------------------------------------------------------
   // 4. Finger lengths
   //
@@ -530,6 +768,34 @@ function extractHandFeatures(landmarks) {
   // ---------------------------------------------------------
 
   const fingerLengths = {
+    thumb:
+      fingerValidity.thumb.valid
+        ? distance3D(landmarks[1], landmarks[4])
+        : null,
+
+    index:
+      fingerValidity.index.valid
+        ? distance3D(landmarks[5], landmarks[8])
+        : null,
+
+    middle:
+      fingerValidity.middle.valid
+        ? distance3D(landmarks[9], landmarks[12])
+        : null,
+
+    ring:
+      fingerValidity.ring.valid
+        ? distance3D(landmarks[13], landmarks[16])
+        : null,
+
+    pinky:
+      fingerValidity.pinky.valid
+        ? distance3D(landmarks[17], landmarks[20])
+        : null,
+  };
+
+/**
+ *const fingerLengths = {
     thumb:
       distance3D(landmarks[1], landmarks[4]),
 
@@ -545,6 +811,9 @@ function extractHandFeatures(landmarks) {
     pinky:
       distance3D(landmarks[17], landmarks[20]),
   };
+
+ * 
+ */
 
   // ---------------------------------------------------------
   // 5. Palm orientation
@@ -601,29 +870,41 @@ function extractHandFeatures(landmarks) {
   // ---------------------------------------------------------
 
   return {
-    landmarks: landmarks.map((point, index) => ({
-      id: index,
-      x: Number(point.x.toFixed(6)),
-      y: Number(point.y.toFixed(6)),
-      z: Number((point.z || 0).toFixed(6)),
-    })),
+    // Raw MediaPipe 3D landmarks
+    landmarks: landmarks.map((point, index) => {
+      if (!isValidLandmark(point)) {
+        return {
+          id: index,
+          x: null,
+          y: null,
+          z: null,
+        };
+      }
 
+      return {
+        id: index,
+        x: Number(point.x.toFixed(6)),
+        y: Number(point.y.toFixed(6)),
+        z: Number(point.z.toFixed(6)),
+      };
+    }),
+
+    // Translation + scale normalized 3D landmarks
     normalizedLandmarks,
 
+    // 3D geometric features
     jointAngles,
-
     fingertipDistances,
-
     fingerLengths,
 
-    // Where is the wrist?
+    // Hand position/orientation
     wristPosition,
-
-    // How is the wrist/hand oriented?
     wristOrientation,
-
-    // Existing palm orientation
     palmNormal: normalizedPalmNormal,
+
+    reliability,
+
+    fingers: fingerValidity,
   };
 }
 
@@ -658,6 +939,8 @@ function logHandSummary(hand, side) {
   console.log('Palm Normal:', hand.palmNormal);
 
   console.log('Fingertip Distances:', hand.fingertipDistances);
+
+  console.log('Reliability:', hand.reliability);
 }
 
 
@@ -670,6 +953,7 @@ export function usePoseTracker() {
   const intervalRef  = useRef(null);
   const sessionIdRef = useRef(null);
   const countRef     = useRef(0);
+  const trackingModeRef = useRef(TRACKING_MODE.FACE);
   const maxFramesRef = useRef(Infinity); // caps sampling to the teacher clip's duration
 
   const [isTracking,  setIsTracking]  = useState(false);
@@ -716,9 +1000,14 @@ export function usePoseTracker() {
         return;
       }
 
-      const rawPose = await detectPose(vid);
+      let rawPose = null;
+      let hands = null;
 
-      const hands = await detectHands(vid);
+      if (trackingModeRef.current === TRACKING_MODE.FACE) {
+        rawPose = await detectPose(vid);
+      } else if (trackingModeRef.current === TRACKING_MODE.HAND) {
+        hands = await detectHands(vid);
+      }
       /** 
        if (hands) {
         console.log('[HANDS]', {
@@ -746,8 +1035,21 @@ export function usePoseTracker() {
         }
       }     
 
-      const visible = !!rawPose;
-      const pose    = rawPose || { yaw: 0, pitch: 0, roll: 0 };
+      //const visible = !!rawPose;
+      //const pose    = rawPose || { yaw: 0, pitch: 0, roll: 0 };
+      const isFaceMode =
+        trackingModeRef.current === TRACKING_MODE.FACE;
+
+      const visible = isFaceMode
+        ? !!rawPose
+        : !!(hands?.left || hands?.right);
+
+      const pose = rawPose || {
+        yaw: 0,
+        pitch: 0,
+        roll: 0,
+      };
+
 
       try {
         await fetch(`${API}/submit_pose`, {
@@ -755,12 +1057,37 @@ export function usePoseTracker() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             session_id: sid,
-            time: parseFloat((countRef.current * SAMPLE_INTERVAL_MS / 1000).toFixed(3)),
-            yaw:   pose.yaw,
-            pitch: pose.pitch,
-            roll:  pose.roll,
+            time: parseFloat(
+              (
+                countRef.current *
+                SAMPLE_INTERVAL_MS /
+                1000
+              ).toFixed(3)
+            ),
+
+            tracking_mode: trackingModeRef.current,
+
+            yaw: isFaceMode ? pose.yaw : null,
+            pitch: isFaceMode ? pose.pitch : null,
+            roll: isFaceMode ? pose.roll : null,
+
             visible,
+
+            hands:
+              trackingModeRef.current === TRACKING_MODE.HAND
+                ? hands
+                : null,
           }),
+
+//          body: JSON.stringify({
+//            session_id: sid,
+//            time: parseFloat((countRef.current * SAMPLE_INTERVAL_MS / 1000).toFixed(3)),
+//            yaw:   pose.yaw,
+//            pitch: pose.pitch,
+//            roll:  pose.roll,
+//            visible,
+//            hands,
+//          }),
         });
         countRef.current += 1;
         setFrameCount(countRef.current);
@@ -777,6 +1104,11 @@ export function usePoseTracker() {
    *   expected to stop tracking when the teacher video ends, as before).
    */
   const startTracking = useCallback(async (videoType = 'up-down', durationSec) => {
+    const trackingMode =
+      VIDEO_TRACKING_MODE[videoType] || TRACKING_MODE.FACE;
+
+    trackingModeRef.current = trackingMode;
+
     setCameraError(null);
     setFrameCount(0);
     setStreamReady(false);

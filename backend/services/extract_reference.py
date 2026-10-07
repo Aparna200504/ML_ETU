@@ -19,7 +19,7 @@ Landmark indices (standard 468-point MediaPipe FaceMesh):
     chin = 152, forehead = 10
 
 Usage:
-    python services/extract_reference.py --video reference/teacher.mp4 --output reference/reference.json
+    python backend\services\extract_reference.py --video backend\reference\pataka.mp4 --output backend\reference\pataka.json --mode hands --rate 6
 """
 
 import cv2
@@ -27,6 +27,9 @@ import numpy as np
 import json
 import argparse
 import os
+from pathlib import Path
+import mediapipe as mp
+from hand_features import extract_hand_features
 
 
 def compute_pose(lm):
@@ -51,63 +54,349 @@ def compute_pose(lm):
     }
 
 
-def extract_reference(video_path: str, output_path: str, sample_rate: int = 6) -> dict:
-    import mediapipe as mp
-    mp_face_mesh = mp.solutions.face_mesh
+def extract_reference(
+    video_path,
+    output_path,
+    sample_rate=6,
+    mode="face"
+):
+    """
+    Extract reference features ONCE from a reference video.
 
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video not found: {video_path}")
+    mode="face":
+        Uses MediaPipe FaceMesh only.
 
-    cap = cv2.VideoCapture(video_path)
-    fps   = cap.get(cv2.CAP_PROP_FPS)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    W     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    duration = total / fps
-    step  = max(1, int(fps / sample_rate))
+    mode="hands":
+        Uses MediaPipe Hands only.
 
-    print(f"[extract_reference] Video: {W}x{H} @ {fps:.1f}fps | {total} frames | {duration:.2f}s")
-    print(f"[extract_reference] Sampling every {step} frames (~{sample_rate}/sec)")
+        The hand landmarks are passed to hand_features.py.
+        No hand mathematics is calculated here.
+
+    The calculated features are saved to JSON and reused later.
+    """
+
+    video_path = Path(video_path)
+    output_path = Path(output_path)
+
+    if not video_path.exists():
+        raise FileNotFoundError(
+            f"Reference video not found: {video_path}"
+        )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    cap = cv2.VideoCapture(str(video_path))
+
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open video: {video_path}"
+        )
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if not fps or fps <= 0:
+        fps = 30.0
+
+    total_frames = int(
+        cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    )
+
+    width = int(
+        cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    )
+
+    height = int(
+        cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    )
+
+    duration = (
+        total_frames / fps
+        if total_frames > 0
+        else 0
+    )
+
+    step = max(
+        1,
+        int(round(fps / sample_rate))
+    )
 
     sequence = []
-    detected = 0
-    sampled  = 0
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,     # treat each sampled frame independently (best accuracy)
-        max_num_faces=1,
-        refine_landmarks=False,
-        min_detection_confidence=0.4,
-    ) as fm:
-        for fi in range(0, total, step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            sampled += 1
+    # ---------------------------------------------------------
+    # FACE MODE
+    # ---------------------------------------------------------
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = fm.process(rgb)
-            if not results.multi_face_landmarks:
-                continue
-            detected += 1
+    if mode == "face":
 
-            lm = results.multi_face_landmarks[0].landmark
-            pose = compute_pose(lm)
+        mp_face_mesh = mp.solutions.face_mesh
 
-            sequence.append({
-                'frame': fi,
-                'time':  round(fi / fps, 4),
-                **pose,
-            })
+        with mp_face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=False,
+            min_detection_confidence=0.4
+        ) as face_mesh:
+
+            frame_index = 0
+
+            while True:
+
+                success, frame = cap.read()
+
+                if not success:
+                    break
+
+                if frame_index % step != 0:
+                    frame_index += 1
+                    continue
+
+                rgb = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2RGB
+                )
+
+                results = face_mesh.process(rgb)
+
+                if not results.multi_face_landmarks:
+                    frame_index += 1
+                    continue
+
+                face_landmarks = (
+                    results.multi_face_landmarks[0]
+                )
+
+                pose = compute_pose(
+                    face_landmarks.landmark
+                )
+
+                sequence.append({
+                    "frame": frame_index,
+                    "time": frame_index / fps,
+                    **pose
+                })
+
+                frame_index += 1
+
+        extraction_method = (
+            "mediapipe_facemesh_solutions_api"
+        )
+
+        feature_type = "face"
+
+    # ---------------------------------------------------------
+    # HAND MODE
+    # ---------------------------------------------------------
+
+    elif mode == "hands":
+
+        mp_hands = mp.solutions.hands
+
+        detected_hand_frames = 0
+
+        with mp_hands.Hands(
+            static_image_mode=True,
+            max_num_hands=2,
+            min_detection_confidence=0.4
+        ) as hands:
+
+            frame_index = 0
+
+            while True:
+
+                success, frame = cap.read()
+
+                if not success:
+                    break
+
+                if frame_index % step != 0:
+                    frame_index += 1
+                    continue
+
+                rgb = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2RGB
+                )
+
+                results = hands.process(rgb)
+
+                hand_data = {
+                    "left": None,
+                    "right": None
+                }
+
+                if results.multi_hand_landmarks:
+
+                    detected_hand_frames += 1
+
+                    for hand_landmarks, handedness in zip(
+                        results.multi_hand_landmarks,
+                        results.multi_handedness
+                    ):
+
+                        # -----------------------------------------
+                        # Convert MediaPipe landmarks to x/y/z
+                        # -----------------------------------------
+
+                        landmarks = [
+                            {
+                                "x": float(point.x),
+                                "y": float(point.y),
+                                "z": float(point.z)
+                            }
+                            for point
+                            in hand_landmarks.landmark
+                        ]
+
+                        # -----------------------------------------
+                        # MediaPipe handedness
+                        # -----------------------------------------
+
+                        side = (
+                            handedness.classification[0].label
+                            .lower()
+                        )
+
+                        if side not in ("left", "right"):
+                            continue
+
+                        # -----------------------------------------
+                        # ALL hand mathematics happens here
+                        # through hand_features.py
+                        # -----------------------------------------
+
+                        features = extract_hand_features(
+                            landmarks
+                        )
+
+                        hand_data[side] = features
+
+                # ---------------------------------------------
+                # IMPORTANT:
+                # Keep the frame even when no hand is detected.
+                #
+                # This preserves the temporal sequence.
+                # Missing hand = None.
+                # ---------------------------------------------
+
+                sequence.append({
+                    "frame": frame_index,
+                    "time": frame_index / fps,
+                    "hands": hand_data
+                })
+
+                frame_index += 1
+
+        extraction_method = (
+            "mediapipe_hands_solutions_api"
+        )
+
+        feature_type = "hands"
+
+    else:
+
+        cap.release()
+
+        raise ValueError(
+            "mode must be either 'face' or 'hands'"
+        )
 
     cap.release()
-    print(f"[extract_reference] Face detected in {detected}/{sampled} sampled frames")
 
-    if len(sequence) == 0:
-        raise RuntimeError("No face detected in any sampled frame. Check video quality/lighting.")
+    if not sequence:
+        raise RuntimeError(
+            f"No usable {mode} features were extracted "
+            f"from {video_path}"
+        )
 
-    return _finalize(sequence, fps, total, duration, sample_rate, output_path)
+    # ---------------------------------------------------------
+    # Metadata
+    # ---------------------------------------------------------
+
+    metadata = {
+        "video": str(video_path),
+        "fps": fps,
+        "sample_rate": sample_rate,
+        "total_frames": total_frames,
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "feature_type": feature_type,
+        "extraction_method": extraction_method,
+        "coordinate_system": "mediapipe_normalized_3d",
+        "sequence_length": len(sequence),
+        "sequence": sequence
+    }
+
+    if mode == "hands":
+
+        metadata["detected_hand_frames"] = (
+            detected_hand_frames
+        )
+
+        metadata["hand_detection_rate"] = (
+            detected_hand_frames / len(sequence)
+            if sequence
+            else 0
+        )
+
+    else:
+
+        yaw_values = [
+            frame["yaw"]
+            for frame in sequence
+            if frame.get("yaw") is not None
+        ]
+
+        pitch_values = [
+            frame["pitch"]
+            for frame in sequence
+            if frame.get("pitch") is not None
+        ]
+
+        roll_values = [
+            frame["roll"]
+            for frame in sequence
+            if frame.get("roll") is not None
+        ]
+
+        metadata["signal_stats"] = {
+            "yaw_min": min(yaw_values) if yaw_values else None,
+            "yaw_max": max(yaw_values) if yaw_values else None,
+            "pitch_min": min(pitch_values) if pitch_values else None,
+            "pitch_max": max(pitch_values) if pitch_values else None,
+            "roll_min": min(roll_values) if roll_values else None,
+            "roll_max": max(roll_values) if roll_values else None,
+        }
+
+    # ---------------------------------------------------------
+    # SAVE ONCE
+    # ---------------------------------------------------------
+
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            metadata,
+            f,
+            indent=2
+        )
+
+    print(
+        f"Saved {feature_type} reference features:"
+        f" {output_path}"
+    )
+
+    print(
+        f"Frames extracted: {len(sequence)}"
+    )
+
+    return metadata 
 
 
 def _finalize(sequence, fps, total, duration, sample_rate, output_path):
@@ -150,8 +439,31 @@ def _finalize(sequence, fps, total, duration, sample_rate, output_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--video',  default='reference/up-down.mp4')
-    parser.add_argument('--output', default='reference/reference.json')
-    parser.add_argument('--rate',   type=int, default=6)
+    parser.add_argument(
+        "--video",
+        default="reference/up-down.mp4"
+    )
+
+    parser.add_argument(
+        "--output",
+        default="reference/reference.json"
+    )
+
+    parser.add_argument(
+        "--rate",
+        type=int,
+        default=6
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["face", "hands"],
+        default="face",
+        help="Feature type to extract from the reference video"
+    )
     args = parser.parse_args()
-    extract_reference(args.video, args.output, args.rate)
+    extract_reference(
+        video_path=args.video,
+        output_path=args.output,
+        sample_rate=args.rate,
+        mode=args.mode
+    )
