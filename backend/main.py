@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from services.compare import compare_sequences
+from services.compare import compare_hand, compare_sequences
 
 
 VIDEO_CONFIGS = {
@@ -19,6 +19,7 @@ VIDEO_CONFIGS = {
         "label":  "Up-Down Head Movements",
         "icon":   "↕",
         "desc":   "Nod your head up and down",
+        "tracking": "face",
     },
     "right-left": {
         "video":  "reference/right-left.mp4",
@@ -26,22 +27,23 @@ VIDEO_CONFIGS = {
         "label":  "Right-Left Head Movements",
         "icon":   "↔",
         "desc":   "Turn your head right and left",
+        "tracking": "face",
     },
     "pataka": {
         "video": "reference/pataka.mp4",
         "json": "reference/pataka.json",
         "label": "Pataka",
-        "icon": "✋",
-        "desc": "Perform the Pataka mudra",
+        "icon": "🖐",
+        "desc": "Show the Pataka hand gesture",
         "tracking": "hand",
     },
 
     "tri_pataka": {
         "video": "reference/tri_pataka.mp4",
         "json": "reference/tri_pataka.json",
-        "label": "Tri Pataka",
-        "icon": "🤚",
-        "desc": "Perform the Tri Pataka mudra",
+        "label": "Tri-Pataka",
+        "icon": "✌️",
+        "desc": "Show the Tri-Pataka hand gesture",
         "tracking": "hand",
     },
 }
@@ -95,10 +97,11 @@ class PoseFrame(BaseModel):
 
     tracking_mode: str = "face"  # "face" or "hand"
 
-    yaw:        float
-    pitch:      float
-    roll:       float
+    yaw:        Optional[float] = None
+    pitch:      Optional[float] = None
+    roll:       Optional[float] = None
     visible:    bool = True
+    fingers:    Optional[List[int]] = None
     hands: Optional[Dict[str, Any]] = None
 
 
@@ -203,6 +206,7 @@ def submit_pose(payload: PoseFrame):
 
         "visible": payload.visible,
 
+        "fingers": payload.fingers,
         "hands": payload.hands,
     })
     count = len(SESSIONS[payload.session_id]["frames"])
@@ -227,8 +231,11 @@ def finish_session(session_id: str):
     visible_count    = sum(1 for f in student_sequence if f.get("visible", True))
     face_visible_pct = round(visible_count / len(student_sequence) * 100, 1)
 
-    reference_sequence = REFERENCE_DATA[video_type]["sequence"]
-    result = compare_sequences(reference_sequence, student_sequence, video_type=video_type)
+    if video_type in ("pataka", "tri_pataka"):
+        result = compare_hand(REFERENCE_DATA[video_type], student_sequence, video_type)
+    else:
+        reference_sequence = REFERENCE_DATA[video_type]["sequence"]
+        result = compare_sequences(reference_sequence, student_sequence, video_type=video_type)
     result["face_visible_pct"] = face_visible_pct
     result["video_type"]       = video_type
     return result

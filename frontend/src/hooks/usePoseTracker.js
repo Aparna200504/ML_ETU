@@ -12,14 +12,9 @@
  */
 
 import { useRef, useCallback, useState, useEffect } from 'react';
-import { 
-    FaceLandmarker,
-    FilesetResolver,
-    HandLandmarker
-  } from '@mediapipe/tasks-vision';
+import { FaceLandmarker, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 
-// const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-const API = 'https://mletu-production.up.railway.app';
+const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 
 const SAMPLE_INTERVAL_MS = 167; // ~6 frames/sec — matches extract_reference.py's sample_rate=6,
@@ -114,47 +109,27 @@ const HAND_MODEL_URL =
 // HandLandmarker singleton
 // ---------------------------------------------------------------------------
 
-let _handLandmarkerPromise = null;
+let _handPromise = null;
 
 async function getHandLandmarker() {
-  if (_handLandmarkerPromise) return _handLandmarkerPromise;
-
-  _handLandmarkerPromise = (async () => {
+  if (_handPromise) return _handPromise;
+  _handPromise = (async () => {
     const vision = await FilesetResolver.forVisionTasks(WASM_BASE);
-
-    try {
-      const hl = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: HAND_MODEL_URL,
-          delegate: 'GPU',
-        },
-        runningMode: 'VIDEO',
-        numHands: 2,
-      });
-
-      console.log('[MP] HandLandmarker ready.');
-      return hl;
-    } catch (gpuError) {
-      console.warn(
-        '[MP] Hand GPU failed. Trying CPU...',
-        gpuError.message
-      );
-
-      const hl = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: HAND_MODEL_URL,
-          delegate: 'CPU',
-        },
-        runningMode: 'VIDEO',
-        numHands: 2,
-      });
-
-      console.log('[MP] HandLandmarker ready (CPU fallback).');
-      return hl;
+    for (const delegate of ['GPU', 'CPU']) {
+      try {
+        return await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: HAND_MODEL_URL, delegate },
+          runningMode: 'VIDEO',
+          numHands: 1,
+        });
+      } catch (e) {
+        console.warn('[MP] Hand load failed:', delegate, e.message);
+      }
     }
+    _handPromise = null;
+    throw new Error('HandLandmarker init failed');
   })();
-
-  return _handLandmarkerPromise;
+  return _handPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +182,31 @@ async function getLandmarker() {
   })();
 
   return _landmarkerPromise;
+}
+
+function computeHandFeatures(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+  const ext = (tip, pip) => (d(tip, 0) > d(pip, 0) * 1.1 ? 1 : 0);
+  return [
+    d(4, 17) > d(3, 17) * 1.05 ? 1 : 0,
+    ext(8, 6), ext(12, 10), ext(16, 14), ext(20, 18),
+  ];
+}
+
+let _lastHandTime = -1;
+let _lastHand = null;
+async function detectHand(videoEl) {
+  let hl;
+  try { hl = await getHandLandmarker(); } catch { return null; }
+  if (!videoEl || videoEl.readyState < 2) return null;
+  const t = videoEl.currentTime;
+  if (t === _lastHandTime) return _lastHand;
+  _lastHandTime = t;
+  let res;
+  try { res = hl.detectForVideo(videoEl, performance.now()); } catch { return null; }
+  if (!res?.landmarks?.length) { _lastHand = null; return null; }
+  _lastHand = computeHandFeatures(res.landmarks[0]);
+  return _lastHand;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,35 +546,6 @@ function normalizeLandmarks(landmarks) {
   };
 }
  */
-
-function calculateHandReliability(landmarks) {
-  if (!landmarks || landmarks.length !== 21) {
-    return {
-      reliable: false,
-      visibleLandmarks: 0,
-      confidence: 0,
-    };
-  }
-
-  // MediaPipe landmark coordinates are still returned even
-  // when some parts of the hand are occluded.
-  // Check whether landmarks contain valid coordinates.
-  const validLandmarks = landmarks.filter(
-    (p) =>
-      Number.isFinite(p.x) &&
-      Number.isFinite(p.y) &&
-      Number.isFinite(p.z)
-  );
-
-  const visibilityRatio = validLandmarks.length / 21;
-
-  return {
-    reliable: visibilityRatio >= 0.8,
-    visibleLandmarks: validLandmarks.length,
-    confidence: Number(visibilityRatio.toFixed(3)),
-  };
-}
-
 
 function extractHandFeatures(landmarks) {
     const reliability = calculateHandReliability(landmarks);
@@ -953,8 +924,8 @@ export function usePoseTracker() {
   const intervalRef  = useRef(null);
   const sessionIdRef = useRef(null);
   const countRef     = useRef(0);
-  const trackingModeRef = useRef(TRACKING_MODE.FACE);
   const maxFramesRef = useRef(Infinity); // caps sampling to the teacher clip's duration
+  const modeRef = useRef('face');
 
   const [isTracking,  setIsTracking]  = useState(false);
   const [frameCount,  setFrameCount]  = useState(0);
@@ -1000,56 +971,15 @@ export function usePoseTracker() {
         return;
       }
 
-      let rawPose = null;
-      let hands = null;
-
-      if (trackingModeRef.current === TRACKING_MODE.FACE) {
-        rawPose = await detectPose(vid);
-      } else if (trackingModeRef.current === TRACKING_MODE.HAND) {
-        hands = await detectHands(vid);
+      let pose = { yaw: 0, pitch: 0, roll: 0 }, fingers = null, visible;
+      if (modeRef.current === 'hand') {
+        fingers = await detectHand(vid);
+        visible = !!fingers;
+      } else {
+        const rawPose = await detectPose(vid);
+        visible = !!rawPose;
+        if (rawPose) pose = rawPose;
       }
-      /** 
-       if (hands) {
-        console.log('[HANDS]', {
-          left: !!hands.left,
-          right: !!hands.right,
-        });
-
-        if (hands.left) {
-          console.log('[LEFT HAND FEATURES]', hands.left);
-        }
-
-        if (hands.right) {
-          console.log('[RIGHT HAND FEATURES]', hands.right);
-        }
-      }
-      */
-
-      if (hands) {
-        if (hands.left) {
-          logHandSummary(hands.left, 'LEFT');
-        }
-
-        if (hands.right) {
-          logHandSummary(hands.right, 'RIGHT');
-        }
-      }     
-
-      //const visible = !!rawPose;
-      //const pose    = rawPose || { yaw: 0, pitch: 0, roll: 0 };
-      const isFaceMode =
-        trackingModeRef.current === TRACKING_MODE.FACE;
-
-      const visible = isFaceMode
-        ? !!rawPose
-        : !!(hands?.left || hands?.right);
-
-      const pose = rawPose || {
-        yaw: 0,
-        pitch: 0,
-        roll: 0,
-      };
-
 
       try {
         await fetch(`${API}/submit_pose`, {
@@ -1065,29 +995,15 @@ export function usePoseTracker() {
               ).toFixed(3)
             ),
 
-            tracking_mode: trackingModeRef.current,
+            tracking_mode: modeRef.current,
 
-            yaw: isFaceMode ? pose.yaw : null,
-            pitch: isFaceMode ? pose.pitch : null,
-            roll: isFaceMode ? pose.roll : null,
+            yaw: modeRef.current === 'face' ? pose.yaw : null,
+            pitch: modeRef.current === 'face' ? pose.pitch : null,
+            roll: modeRef.current === 'face' ? pose.roll : null,
 
             visible,
-
-            hands:
-              trackingModeRef.current === TRACKING_MODE.HAND
-                ? hands
-                : null,
+            fingers,
           }),
-
-//          body: JSON.stringify({
-//            session_id: sid,
-//            time: parseFloat((countRef.current * SAMPLE_INTERVAL_MS / 1000).toFixed(3)),
-//            yaw:   pose.yaw,
-//            pitch: pose.pitch,
-//            roll:  pose.roll,
-//            visible,
-//            hands,
-//          }),
         });
         countRef.current += 1;
         setFrameCount(countRef.current);
@@ -1096,18 +1012,16 @@ export function usePoseTracker() {
   }
 
   /**
-   * startTracking(videoType, durationSec)
+   * startTracking(videoType, durationSec, mode)
    * @param {string} videoType   'up-down' | 'right-left'
    * @param {number} [durationSec]  teacher clip duration, used to cap the
    *   number of frames sampled so capture can never run past the reference
    *   clip (optional — if omitted, no cap is applied and the caller is
    *   expected to stop tracking when the teacher video ends, as before).
+   * @param {string} [mode]  tracking mode override ('face' | 'hand')
    */
-  const startTracking = useCallback(async (videoType = 'up-down', durationSec) => {
-    const trackingMode =
-      VIDEO_TRACKING_MODE[videoType] || TRACKING_MODE.FACE;
-
-    trackingModeRef.current = trackingMode;
+  const startTracking = useCallback(async (videoType = 'up-down', durationSec, mode = 'face') => {
+    modeRef.current = mode;
 
     setCameraError(null);
     setFrameCount(0);

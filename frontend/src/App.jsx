@@ -22,8 +22,8 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { ResultScreen } from './components/ResultScreen';
 import { usePoseTracker } from './hooks/usePoseTracker';
 
-// const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-const API = 'https://mletu-production.up.railway.app';
+const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+// const API = 'https://mletu-production.up.railway.app';
 
 // Where "Complete & Next" sends the learner once they finish the final step.
 const COMPLETE_REDIRECT_URL =
@@ -36,6 +36,7 @@ const VIDEO_OPTIONS = [
     label: 'Up-Down',
     icon:  '↕',
     color: '#E5862D',
+    mode:  'face',
     instruction: 'Nod your head up and down',
   },
   {
@@ -43,7 +44,24 @@ const VIDEO_OPTIONS = [
     label: 'Right-Left',
     icon:  '↔',
     color: '#2F9E73',
+    mode:  'face',
     instruction: 'Turn your head right and left',
+  },
+  {
+    type:  'pataka',
+    label: 'Pataka',
+    icon:  '🖐',
+    color: '#ec640e',
+    mode:  'hand',
+    instruction: 'Show the Pataka hand gesture',
+  },
+  {
+    type:  'tri_pataka',
+    label: 'Tri-Pataka',
+    icon:  '✌️',
+    color: '#bb4b06', 
+    mode:  'hand',
+    instruction: 'Show the Tri-Pataka hand gesture',
   },
 ];
 
@@ -59,12 +77,15 @@ export default function App() {
   const [teacherPlaying, setTeacherPlaying] = useState(false);
   const [starting,       setStarting]       = useState(false);
   const [finishing,      setFinishing]      = useState(false);
+  const [teacherVideoError, setTeacherVideoError] = useState(false);
 
   const teacherVideoRef  = useRef(null);
   const resultSectionRef = useRef(null);
 
   const current   = VIDEO_OPTIONS[videoIndex];
   const videoType = current.type;
+  const trackingMode = current.mode;
+  const isHandMode = trackingMode === 'hand';
 
   const {
     videoRef: webcamRef,
@@ -123,6 +144,7 @@ export default function App() {
     setStatus('');
     setProgress(0);
     setHasWatchedOnce(false);
+    setTeacherVideoError(false);
     setTeacherPlaying(false);
     const vid = teacherVideoRef.current;
     if (vid) { vid.pause(); vid.currentTime = 0; }
@@ -191,7 +213,7 @@ export default function App() {
     // tracking, exactly as before. Reference availability itself is no
     // longer required to unlock the button — the backend already validates
     // it in /start_session and reports a clear error if something is wrong.
-    const ok = await startTracking(videoType, refInfo?.duration);
+    const ok = await startTracking(videoType, refInfo?.duration, trackingMode);
     setStarting(false);
     if (!ok) { setStatus(''); return; }
 
@@ -204,7 +226,7 @@ export default function App() {
       vid.currentTime = 0;
       setTimeout(() => vid.play().catch(() => {}), 250);
     }
-  }, [hasWatchedOnce, refInfo, startTracking, videoType]);
+  }, [hasWatchedOnce, refInfo, startTracking, videoType, trackingMode]);
 
   const handleStopCamera = useCallback(() => {
     if (!isTracking) return;
@@ -280,7 +302,8 @@ export default function App() {
         {VIDEO_OPTIONS.map((opt, idx) => {
           const isActive = idx === videoIndex;
           const meta      = videoMeta[opt.type];
-          const available = !meta || meta.available;
+          const metaLoaded = Object.keys(videoMeta).length > 0;
+          const available  = !metaLoaded || !!(meta && meta.available);
           return (
             <button
               key={opt.type}
@@ -318,7 +341,9 @@ export default function App() {
         <div style={styles.videoBox}>
           <div style={styles.videoLabel}>Teacher · {current.label}</div>
           <video
+            key={videoType}
             ref={teacherVideoRef}
+            onError={() => setTeacherVideoError(true)}
             src={teacherVideoSrc}
             onEnded={handleTeacherEnded}
             onPlay={handleTeacherPlay}
@@ -327,6 +352,11 @@ export default function App() {
             style={styles.video}
             playsInline
           />
+          {teacherVideoError && (
+            <div style={styles.cameraError}>
+              Teacher video for “{current.label}” could not be loaded.
+            </div>
+          )}
           <div style={styles.progressTrack}>
             <div style={{ ...styles.progressBar, width: `${progress}%` }} />
           </div>
@@ -413,7 +443,7 @@ export default function App() {
       <div style={styles.assessFooter}>
         <span style={{ color: isTracking ? '#2F9E73' : '#8A6F6F' }}>
           {isTracking
-            ? `● Tracking ${frameCount} frames (MediaPipe)`
+            ? `● Tracking ${frameCount} frames (MediaPipe ${isHandMode ? 'Hands' : 'Face'})`
             : !hasWatchedOnce
               ? '○ Watch the teacher video fully once to unlock Start Camera'
               : '○ Ready — click Start Camera when you are'}
@@ -449,7 +479,7 @@ export default function App() {
         {result === false && (
           <div style={styles.centered}>
             <p style={{ color: '#B23A3A', marginBottom: 20 }}>
-              Could not compute score — make sure your face was visible throughout.
+              Could not compute score — make sure your {isHandMode ? 'hand was visible throughout' : 'face was visible throughout'}.
             </p>
             <button onClick={handleRetrySame} style={styles.primaryBtn}>Try Again</button>
           </div>

@@ -13,16 +13,17 @@ import { ScoreRing } from './ScoreRing';
 
 export function ResultScreen({ result, studentName, videoType = 'up-down', onRetry, onNext, nextLabel }) {
   const {
-    overall_score, face_visible_pct,
+    overall_score = 0, face_visible_pct = 0,
     // pitch axis (up-down)
     up_score, down_score,
     // yaw axis (right-left)
     right_score = 0, left_score = 0,
-    feedback, grade, movement_details,
+    feedback = [], grade = 'Error', movement_details,
     false_start_detected, skipped_frames,
   } = result;
 
   const isRightLeft = videoType === 'right-left';
+  const isHand      = videoType === 'pataka' || videoType === 'tri_pataka';
 
   // Directional score rings — swap based on video type
   const directionalScores = isRightLeft
@@ -49,15 +50,18 @@ export function ResultScreen({ result, studentName, videoType = 'up-down', onRet
     'Error':             '#B23A3A',
   }[grade] || '#8A6F6F';
 
-  const stepLabel = isRightLeft ? 'Right-Left Head Turns' : 'Up-Down Head Nods';
+  const stepLabel = isHand
+    ? (videoType === 'pataka' ? 'Pataka Hand Gesture' : 'Tri-Pataka Hand Gesture')
+    : isRightLeft ? 'Right-Left Head Turns' : 'Up-Down Head Nods';
 
   return (
     <div style={styles.wrapper}>
 
       {/* Step type tag */}
-      <div style={{ ...styles.stepTag, color: isRightLeft ? '#2F9E73' : '#E5862D',
-                    borderColor: isRightLeft ? '#2F9E73' : '#E5862D' }}>
-        {isRightLeft ? '↔' : '↕'} {stepLabel}
+      <div style={{ ...styles.stepTag,
+                    color: isHand ? '#ec640e' : isRightLeft ? '#2F9E73' : '#E5862D',
+                    borderColor: isHand ? '#ec640e' : isRightLeft ? '#2F9E73' : '#E5862D' }}>
+        {isHand ? '🖐' : isRightLeft ? '↔' : '↕'} {stepLabel}
       </div>
 
       {/* Grade badge */}
@@ -79,7 +83,7 @@ export function ResultScreen({ result, studentName, videoType = 'up-down', onRet
           <ScoreRing key={label} score={score} label={label} color={color} size={80} />
         ))}
         */}
-        <ScoreRing score={face_visible_pct} label="Face Visible" color="#E5862D" size={80} />
+        <ScoreRing score={face_visible_pct} label={isHand ? 'Hand Visible' : 'Face Visible'} color="#E5862D" size={80} />
       </div>
 
       {/* False-start note */}

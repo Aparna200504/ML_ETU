@@ -495,3 +495,34 @@ def _empty_result(msg: str) -> Dict:
         'movement_details': {}, 'feedback': [msg], 'grade': 'Error',
         'false_start_detected': False, 'skipped_frames': 0,
     }
+
+
+HAND_TARGETS = {
+    'pataka':     [0, 1, 1, 1, 1],
+    'tri_pataka': [0, 1, 1, 0, 1],
+}
+
+
+def compare_hand(reference: Dict, student: List[Dict], video_type: str) -> Dict:
+    frames = [f['fingers'] for f in student if f.get('fingers')]
+    if len(frames) < 3:
+        result = _empty_result('Hand not detected. Keep your hand clearly visible.')
+        result['face_visible_pct'] = 0
+        return result
+
+    target = np.array(HAND_TARGETS[video_type])
+    per_frame = [float(np.mean(np.array(frame) == target)) for frame in frames]
+    score = round(float(np.mean(per_frame)) * 100, 1)
+    grade = _grade(score)
+    feedback = [f'Gesture match: {score}%.']
+    if score < 80:
+        feedback.append(
+            'Check which fingers should be straight and which should be curled, and hold the pose steady.'
+        )
+    return {
+        'overall_score': score, 'timing_score': 100, 'grade': grade,
+        'feedback': feedback, 'movement_details': {},
+        'yaw_score': 0, 'pitch_score': 0, 'roll_score': 0,
+        'up_score': 0, 'down_score': 0, 'right_score': 0, 'left_score': 0,
+        'false_start_detected': False, 'skipped_frames': 0,
+    }
